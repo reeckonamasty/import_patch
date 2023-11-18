@@ -1,0 +1,187 @@
+diff --git a/Api/Config/ProfileConfigInterface.php b/Api/Config/ProfileConfigInterface.php
+index 84651bbfcfd4db14a663274a7e67b38e31992fcc..4e3f935b2608bf381176c24d70c651756bdac160 100644
+--- a/Api/Config/ProfileConfigInterface.php
++++ b/Api/Config/ProfileConfigInterface.php
+@@ -158,4 +158,16 @@ interface ProfileConfigInterface extends \Magento\Framework\Api\ExtensibleDataIn
+     public function setExtensionAttributes(
+         \Amasty\ExportCore\Api\Config\ProfileConfigExtensionInterface $extensionAttributes
+     ): ProfileConfigInterface;
++
++    /**
++     * @return string
++     */
++    public function getAllowedStoreIds(): ?string;
++
++    /**
++     * @param string $allowedStoreIds
++     *
++     * @return \Amasty\ExportCore\Api\Config\ProfileConfigInterface
++     */
++    public function setAllowedStoreIds(?string $allowedStoreIds): ProfileConfigInterface;
+ }
+diff --git a/Export/Action/Preparation/PrepareCollectionAction.php b/Export/Action/Preparation/PrepareCollectionAction.php
+index 36cf846d8940cbb1818b7bdcde31bba49eabd369..0b6ad7db15c539dbc9c70507c222460415919ef7 100644
+--- a/Export/Action/Preparation/PrepareCollectionAction.php
++++ b/Export/Action/Preparation/PrepareCollectionAction.php
+@@ -48,6 +48,11 @@ class PrepareCollectionAction implements ActionInterface
+             $exportProcess->getProfileConfig()->getEntityCode(),
+             $exportProcess->getProfileConfig()->getFieldsConfig()
+         );
++
++        if ($allowedStoreIds = $exportProcess->getProfileConfig()->getAllowedStoreIds()) {
++            $collection->addFieldToFilter('store_id', ['in' => $allowedStoreIds]);
++        }
++
+         $exportProcess->getExportResult()->setTotalRecords($collection->getSize());
+         if (!$exportProcess->getExportResult()->getTotalRecords()) {
+             throw new LocalizedException(__('There are no export results'));
+diff --git a/Export/Config/ProfileConfig.php b/Export/Config/ProfileConfig.php
+index 6a12c5f6fd680b7d92d49267b2f0dfdcf13f64d4..cb126d1cb6bf7ccf24e5ca67407e008f3e024ecd 100644
+--- a/Export/Config/ProfileConfig.php
++++ b/Export/Config/ProfileConfig.php
+@@ -10,6 +10,8 @@ use Amasty\ExportCore\Api\Config\ProfileConfigInterface;
+ use Amasty\ExportCore\Api\Config\ProfileConfigExtensionInterfaceFactory;
+ use Amasty\ExportCore\Export\PostProcessing\Type\Encoding\ConfigInterface as EncodingConfigInterface;
+ use Magento\Framework\DataObject;
++use Magento\AdminGws\Model\Role;
++use Magento\Framework\ObjectManagerInterface;
+ 
+ class ProfileConfig extends DataObject implements ProfileConfigInterface
+ {
+@@ -24,22 +26,38 @@ class ProfileConfig extends DataObject implements ProfileConfigInterface
+     public const POST_PROCESSORS = 'post_processors';
+     public const FIELDS_CONFIG = 'fields_config';
+     public const MODULE_TYPE = 'module_type';
++    public const ALLOWED_STORE_IDS = 'allowed_store_ids';
+ 
+     /**
+      * @var ProfileConfigExtensionInterfaceFactory
+      */
+     private $extensionAttributesFactory;
+ 
++    /**
++     * @var null|Role
++     */
++    private $role = null;
++
+     public function __construct(
++        ObjectManagerInterface $objectManager,
+         ProfileConfigExtensionInterfaceFactory $extensionAttributesFactory,
+         array $data = []
+     ) {
+         parent::__construct($data);
+         $this->extensionAttributesFactory = $extensionAttributesFactory;
++        $this->objectManager = $objectManager;
+     }
+ 
+     public function initialize(): ProfileConfigInterface
+     {
++        if ($gwsRole = $this->getGwsRole()) {
++            $this->setAllowedStoreIds(
++                !$gwsRole->getIsAll()
++                    ? implode(',', $this->role->getStoreGroupIds())
++                    : '0'
++            );
++        }
++
+         return $this;
+     }
+ 
+@@ -191,4 +209,25 @@ class ProfileConfig extends DataObject implements ProfileConfigInterface
+ 
+         return $this;
+     }
++
++    public function getAllowedStoreIds(): ?string
++    {
++        return $this->getData(self::ALLOWED_STORE_IDS);
++    }
++
++    public function setAllowedStoreIds(?string $allowedStoreIds): ProfileConfigInterface
++    {
++        $this->setData(self::ALLOWED_STORE_IDS, $allowedStoreIds);
++
++        return $this;
++    }
++
++    private function getGwsRole(): ?Role
++    {
++        if (!$this->role && class_exists(Role::class)) {
++            $this->role = $this->objectManager->get(Role::class);
++        }
++
++        return $this->role;
++    }
+ }
+diff --git a/Export/Filter/Type/Store/Meta.php b/Export/Filter/Type/Store/Meta.php
+index 6d1ef2d2966df43a1e4b5ab9b35e9980b43c1cb3..9410da889c5c1b01779ffa9e2e3c2040362eda40 100644
+--- a/Export/Filter/Type/Store/Meta.php
++++ b/Export/Filter/Type/Store/Meta.php
+@@ -5,7 +5,9 @@ namespace Amasty\ExportCore\Export\Filter\Type\Store;
+ use Amasty\ExportCore\Api\Config\Entity\Field\FieldInterface;
+ use Amasty\ExportCore\Api\Config\Profile\FieldFilterInterface;
+ use Amasty\ExportCore\Api\Filter\FilterMetaInterface;
++use Magento\AdminGws\Model\Role;
+ use Magento\Cms\Ui\Component\Listing\Column\Cms\Options;
++use Magento\Framework\ObjectManagerInterface;
+ 
+ class Meta implements FilterMetaInterface
+ {
+@@ -19,22 +21,41 @@ class Meta implements FilterMetaInterface
+      */
+     private $options;
+ 
++    /**
++     * @var ObjectManagerInterface
++     */
++    private $objectManager;
++
++    /**
++     * @var null|Role
++     */
++    private $role = null;
++
+     public function __construct(
+         ConfigInterfaceFactory $configFactory,
+-        Options $options
++        Options $options,
++        ObjectManagerInterface $objectManager
+     ) {
+         $this->configFactory = $configFactory;
+         $this->options = $options;
++        $this->objectManager = $objectManager;
+     }
+ 
+     public function getJsConfig(FieldInterface $field): array
+     {
+         $options = $this->options->toOptionArray();
++        $removeAllStoreViews =  $this->getGwsRole() && !$this->getGwsRole()->getIsAll();
++
+         if (empty($options)) {
+             return [];
+         }
+ 
+-        foreach ($options as &$option) {
++        foreach ($options as $key => &$option) {
++            if ($removeAllStoreViews && $option['value'] === '0') {
++                unset($options[$key]);
++                continue;
++            }
++
+             $option['value'] = !is_array($option['value']) ? (string)$option['value'] : $option['value'];
+         }
+ 
+@@ -72,4 +93,13 @@ class Meta implements FilterMetaInterface
+ 
+         return null;
+     }
++
++    private function getGwsRole(): ?Role
++    {
++        if (!$this->role && class_exists(Role::class)) {
++            $this->role = $this->objectManager->get(Role::class);
++        }
++
++        return $this->role;
++    }
+ }
